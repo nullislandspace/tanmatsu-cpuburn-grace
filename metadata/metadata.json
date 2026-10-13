@@ -1,6 +1,6 @@
 {
-  "name": "Grace Template",
-  "description": "Template app using Graceloader",
+  "name": "CPU Burn",
+  "description": "Load both cores and watch battery, power supply and temperatures",
   "categories": ["tools"],
   "version": "0.1.0",
   "icon": {

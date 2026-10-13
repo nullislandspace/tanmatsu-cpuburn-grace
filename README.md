@@ -1,6 +1,71 @@
-# Tanmatsu graceloader template app project
+# CPU Burn
 
-This template project shows how to build an app for Tanmatsu using [Graceloader](https://github.com/nullislandspace/tanmatsu-graceloader)
+A diagnostic tool for the Tanmatsu: it loads both cores of the ESP32-P4 and shows
+what that does to the power system and to the temperatures.
+
+| Key | What it does |
+|---|---|
+| F6 | Start / stop the CPU load |
+| F4 / F5 | Load down / up in 5 % steps |
+| F3 | Optional external VFD: off / all segments lit |
+| F1, ESC | Back to the launcher |
+
+The report is the launcher's **Power information** dialog (battery type, charging
+state and currents, battery voltage, remaining charge, power supply, system and
+input voltage, SoC temperature) plus the load measured per core, the chip
+information and what the BQ25895 charger reports.
+
+The panel is 480x800 and the BSP rotates it, so the usable area is 800x480. That
+is wide enough for two columns and too short for one long list: the load and chip
+readings go left, the power and temperature readings right. Nothing is dropped
+silently — a line that does not fit is truncated with `~` or skipped, and the
+footer says how many.
+
+The burn tasks run one per core at priority 1, above the idle tasks and below the
+services graceloader and the BSP bring up. Each busy chunk is followed by a one
+tick delay: the coprocessor task that delivers keyboard events runs at priority 0
+and would otherwise never get the CPU, which would make the load impossible to
+switch off. That is also what the load percentage means — the busy share of a
+busy-plus-yield cycle, measured per core rather than assumed. Because of that tick
+the load tops out at 95 % (190 ms busy, 10 ms yield at the 10 ms tick), which is as
+close to 100 % as the scheduler gets while the keyboard keeps working. `Target` is
+what the generator aims for, the per-core percentage is what it measured; the
+chunk size is learned from the chunks that actually ran, so the two agree.
+
+Keyboard latency follows from the same tick: the priority-0 coprocessor task only
+gets the core during the yield window, so at 90 % a key press can take up to
+~100 ms to show up.
+
+The BQ25895 has no readable temperature on the Tanmatsu: its TS pin carries no
+thermistor but a fixed 10 kΩ / 10 kΩ divider to REGN (R52, R53), so `ADC_TS` is a
+constant ~50 % and the NTC cold/hot faults can never fire. What the IC does say
+about its own temperature is the thermal shutdown fault, which is shown together
+with the TS percentage. The coprocessor reports `ADC_TS` in units of 0.01 %
+(2100..7956 for 21.00 %..79.56 %), so the UI divides it by 100 before printing it.
+
+## Optional external VFD
+
+Some units carry the I2C VFD add-on (NE-HCS12SS59T-R1, twelve ASCII characters,
+jumpered to address 0x13). It is probed on the CATT bus first and on the internal
+bus second, the same probe as SynthMiner's VFD, which this is ported from; a badge
+without one just shows `VFD: no display found` and every call here is a no-op.
+
+F3 toggles it between switched off — the default, and how the app leaves it on the
+way out — and switched on with all twelve characters showing `8`, the busiest glyph
+of the five-by-seven font: 23 of its 35 dots lit, against 21 for `&` and 20 for
+`#`, `@` and `B`. That is the most the tube can be asked to light through its text
+buffer, which makes it the display-side counterpart of loading both cores: the
+pattern draws the most filament and grid current, so the tube can be part of what
+the power readings on the right column are measuring. Filament current stays at
+the device default of 110 — pushing it higher only shortens the tube's life.
+
+All I2C traffic runs in its own task at the burn tasks' priority, so it never takes
+a slice from the load generator; it runs in the yield window every burn cycle
+leaves.
+
+## Template project
+
+This project is based on the [Graceloader](https://github.com/nullislandspace/tanmatsu-graceloader) template app.
 
 ## 3D: SynthEngine3D
 

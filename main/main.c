@@ -1,39 +1,289 @@
+// cpuburn: load both cores of the ESP32-P4 and watch what that does to the
+// power system and to the temperatures. F6 starts and stops the load, F4/F5
+// set how much of every cycle is busy, F3 toggles an optional external VFD,
+// F1/ESC goes back to the launcher.
+#include <inttypes.h>
 #include <stdio.h>
+#include <string.h>
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "bsp/input.h"
-#include "bsp/led.h"
 #include "bsp/power.h"
-#include "gl_input.h"
+#include "burn.h"
 #include "driver/gpio.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_lcd_types.h"
+#include "esp_chip_info.h"
+#include "esp_clk.h"
 #include "esp_log.h"
-#include "hal/lcd_types.h"
+#include "esp_system.h"
+#include "gl_input.h"
 #include "nvs_flash.h"
 #include "pax_fonts.h"
 #include "pax_gfx.h"
 #include "pax_text.h"
+#include "pax_types.h"
+#include "power_info.h"
 #include "portmacro.h"
+#include "vfd.h"
 
 // Constants
 static char const TAG[] = "main";
 
+#define TEXT_FONT  pax_font_sky_mono
+#define TEXT_SIZE  16
+#define LINE_PITCH (TEXT_SIZE + 2)
+#define MARGIN_X   12
+#define HEADER_H   34
+#define FOOTER_H   30
+#define CONTENT_Y  (HEADER_H + 10)
+// Sky Mono glyphs are 7x9 pixels at their nominal size of 9, so the advance of
+// every glyph is this wide. The columns are laid out with that number.
+#define CHAR_W            (TEXT_SIZE * 7.0f / 9.0f)
+// Longest line of the right column, in characters.
+#define RIGHT_COLUMN_CHARS 33
+// Longest line of the left column, in characters.
+#define LEFT_COLUMN_CHARS  26
+
+#define COL_BACKGROUND 0xFFFFFFFF
+#define COL_FOREGROUND 0xFF000000
+#define COL_BAR        0xFF202020
+#define COL_BAR_TEXT   0xFFFFFFFF
+#define COL_WARN       0xFFB00000
+#define COL_DIVIDER    0xFFC8C8C8
+
 // Global variables
-static size_t                       display_h_res        = 0;
-static size_t                       display_v_res        = 0;
-static bsp_display_color_format_t   display_color_format = BSP_DISPLAY_COLOR_FORMAT_16_565RGB;
-static bsp_display_endianness_t     display_data_endian  = BSP_DISPLAY_ENDIAN_LITTLE;
-static pax_buf_t                    fb                   = {0};
-static QueueHandle_t                input_event_queue    = NULL;
+static size_t                     display_h_res        = 0;
+static size_t                     display_v_res        = 0;
+static bsp_display_color_format_t display_color_format = BSP_DISPLAY_COLOR_FORMAT_16_565RGB;
+static bsp_display_endianness_t   display_data_endian  = BSP_DISPLAY_ENDIAN_LITTLE;
+static pax_buf_t                  fb                   = {0};
+static QueueHandle_t              input_event_queue    = NULL;
+static esp_chip_info_t            chip                 = {0};
 
 #if defined(CONFIG_BSP_TARGET_KAMI)
 // Temporary addition for supporting epaper devices (irrelevant for Tanmatsu)
 static pax_col_t palette[] = {0xffffffff, 0xff000000, 0xffff0000};  // white, black, red
 #endif
 
-void blit(void) {
+static void blit(void) {
     bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb));
+}
+
+// Lines that did not fit on screen, for the current frame. Silently dropping a
+// reading is worse than admitting it, so these get reported in the footer.
+static unsigned dropped_line_count = 0;
+static unsigned clipped_line_count = 0;
+
+// Draw one line of a column, returning the index of the next line. Lines that
+// would run into the footer are dropped, lines that would run off the right
+// edge are truncated with a trailing '~'.
+static int draw_line(float x, int line, pax_col_t color, char const* text) {
+    float const bottom  = (float)pax_buf_get_height(&fb) - FOOTER_H;
+    float const limit_x = (float)pax_buf_get_width(&fb) - MARGIN_X;
+    float const y       = CONTENT_Y + LINE_PITCH * line;
+
+    if (y + TEXT_SIZE > bottom) {
+        dropped_line_count++;
+        return line + 1;
+    }
+
+    size_t const len = strlen(text);
+    if (x + (float)len * CHAR_W > limit_x) {
+        clipped_line_count++;
+        char clipped[128];
+        size_t const keep = (size_t)((limit_x - x) / CHAR_W);
+        if (keep < 2) {
+            clipped[0] = '\0';
+        } else {
+            snprintf(clipped, sizeof(clipped), "%.*s~", (int)(keep - 1), text);
+        }
+        pax_draw_text(&fb, color, TEXT_FONT, TEXT_SIZE, x, y, clipped);
+    } else {
+        pax_draw_text(&fb, color, TEXT_FONT, TEXT_SIZE, x, y, text);
+    }
+
+    return line + 1;
+}
+
+static void render(void) {
+    power_info_t power;
+    power_info_collect(&power);
+
+    burn_core_stat_t stats[portNUM_PROCESSORS];
+    uint32_t   core_count = burn_core_count();
+    uint32_t   total_ops = burn_sample(stats, core_count);
+    uint32_t   total_load = 0;
+    for (uint32_t i = 0; i < core_count; i++) {
+        total_load += stats[i].load_percent;
+    }
+    if (core_count > 0) {
+        total_load /= core_count;
+    }
+
+    char text[128];
+
+    dropped_line_count = 0;
+    clipped_line_count = 0;
+
+    int const screen_w = pax_buf_get_width(&fb);
+    int const screen_h = pax_buf_get_height(&fb);
+    // The panel is 480x800 and the BSP rotates it, so what is left after
+    // pax_buf_get_width/height is 800x480. Two columns fit that, one does not.
+    float const left_x    = MARGIN_X;
+    float const divider_x = left_x + (float)LEFT_COLUMN_CHARS * CHAR_W + 6.0f;
+    float       right_x   = (float)(screen_w - MARGIN_X) - (float)RIGHT_COLUMN_CHARS * CHAR_W;
+    if (right_x < divider_x + 12.0f) {
+        right_x = divider_x + 12.0f;
+    }
+    float const footer_y = (float)(screen_h - FOOTER_H + 7);
+
+    pax_background(&fb, COL_BACKGROUND);
+    pax_simple_rect(&fb, COL_BAR, 0, 0, screen_w, HEADER_H);
+    pax_simple_rect(&fb, COL_BAR, 0, screen_h - FOOTER_H, screen_w, FOOTER_H);
+    pax_simple_rect(&fb, COL_DIVIDER, (int)divider_x, CONTENT_Y - 6, 1, screen_h - FOOTER_H - CONTENT_Y + 2);
+    pax_draw_text(&fb, COL_BAR_TEXT, TEXT_FONT, TEXT_SIZE, MARGIN_X, 9, "CPU load diagnostic");
+    pax_draw_text(&fb, COL_BAR_TEXT, TEXT_FONT, TEXT_SIZE, MARGIN_X, footer_y,
+                  "F1/ESC Back   F3 VFD   F4/F5 Load -5/+5   F6 Start/Stop");
+
+    int line = 0;
+
+    snprintf(text, sizeof(text), "Load: %s", burn_is_enabled() ? "RUNNING" : "IDLE");
+    line = draw_line(left_x, line, burn_is_enabled() ? COL_WARN : COL_FOREGROUND, text);
+    snprintf(text, sizeof(text), "Target: %" PRIu32 " %%", burn_get_load_percent());
+    line = draw_line(left_x, line, COL_FOREGROUND, text);
+    for (uint32_t i = 0; i < core_count; i++) {
+        snprintf(text, sizeof(text), "Core %" PRIu32 ": %5.1f Mops %3" PRIu32 " %%", i,
+                 (float)stats[i].ops_per_s / 1000000.0f, stats[i].load_percent);
+        line = draw_line(left_x, line, COL_FOREGROUND, text);
+    }
+    snprintf(text, sizeof(text), "Total:  %5.1f Mops %3" PRIu32 " %%", (float)total_ops / 1000000.0f, total_load);
+    line = draw_line(left_x, line, COL_FOREGROUND, text);
+
+    line++;
+
+    char const* model = "Unknown";
+    switch (chip.model) {
+        case CHIP_ESP32P4:
+            model = "ESP32-P4";
+            break;
+        case CHIP_ESP32S3:
+            model = "ESP32-S3";
+            break;
+        default:
+            break;
+    }
+    snprintf(text, sizeof(text), "Chip: %s r%" PRIu16 ", %" PRIu8 " cores", model, chip.revision, chip.cores);
+    line = draw_line(left_x, line, COL_FOREGROUND, text);
+    snprintf(text, sizeof(text), "Clock: %d MHz", esp_clk_cpu_freq());
+    line = draw_line(left_x, line, COL_FOREGROUND, text);
+    snprintf(text, sizeof(text), "Free heap: %" PRIu32 " kB", esp_get_free_heap_size() / 1024);
+    line = draw_line(left_x, line, COL_FOREGROUND, text);
+
+    line++;
+
+    // The optional tube (vfd.h). What F3 was asked for, and whether there is
+    // a display at all to ask -- a missing one should not look like a dead key.
+    char const* vfd_state = vfd_is_present() ? (vfd_is_enabled() ? "on, all segments" : "off") : "no display found";
+    snprintf(text, sizeof(text), "VFD: %s", vfd_state);
+    line = draw_line(left_x, line, vfd_is_enabled() ? COL_WARN : COL_FOREGROUND, text);
+
+    // Right column: the readings of the launcher's Power information dialog.
+    line = 0;
+
+    if (power.battery_err != ESP_OK) {
+        snprintf(text, sizeof(text), "Battery: unavailable (%s)", esp_err_to_name(power.battery_err));
+        line = draw_line(right_x, line, COL_WARN, text);
+    } else if (power.battery.battery_available) {
+        snprintf(text, sizeof(text), "Battery type: %s", power.battery.type ? power.battery.type : "Unknown");
+        line = draw_line(right_x, line, COL_FOREGROUND, text);
+        snprintf(text, sizeof(text), "Charging disabled: %s", power.battery.charging_disabled ? "Yes" : "No");
+        line = draw_line(right_x, line, COL_FOREGROUND, text);
+        snprintf(text, sizeof(text), "Battery charging: %s", power.battery.battery_charging ? "Yes" : "No");
+        line = draw_line(right_x, line, COL_FOREGROUND, text);
+        snprintf(text, sizeof(text), "Max charging current: %" PRIu16 " mA", power.battery.maximum_charging_current);
+        line = draw_line(right_x, line, COL_FOREGROUND, text);
+        snprintf(text, sizeof(text), "Charging current: %" PRIu16 " mA", power.battery.current_charging_current);
+        line = draw_line(right_x, line, COL_FOREGROUND, text);
+        snprintf(text, sizeof(text), "Battery voltage: %" PRIu16 " mV", power.battery.voltage);
+        line = draw_line(right_x, line, COL_FOREGROUND, text);
+        snprintf(text, sizeof(text), "Charging target voltage: %" PRIu16 " mV", power.battery.charging_target_voltage);
+        line = draw_line(right_x, line, COL_FOREGROUND, text);
+        snprintf(text, sizeof(text), "Remaining charge: %.2f %%", power.battery.remaining_percentage);
+        line = draw_line(right_x, line, COL_FOREGROUND, text);
+    } else {
+        snprintf(text, sizeof(text), "No battery detected");
+        line = draw_line(right_x, line, COL_FOREGROUND, text);
+    }
+
+    line++;
+
+    snprintf(text, sizeof(text), "Power supply detected: %s", power.battery.power_supply_available ? "Yes" : "No");
+    line = draw_line(right_x, line, COL_FOREGROUND, text);
+    if (power.has_system_voltage) {
+        snprintf(text, sizeof(text), "System voltage: %" PRIu16 " mV", power.system_voltage);
+        line = draw_line(right_x, line, COL_FOREGROUND, text);
+    }
+    if (power.has_input_voltage) {
+        snprintf(text, sizeof(text), "Input voltage: %" PRIu16 " mV", power.input_voltage);
+        line = draw_line(right_x, line, COL_FOREGROUND, text);
+    }
+
+    line++;
+
+    if (power.has_soc_temperature) {
+        snprintf(text, sizeof(text), "SoC temperature: ~%.2f *C", power.soc_temperature);
+        line = draw_line(right_x, line, power.soc_temperature > 70.0f ? COL_WARN : COL_FOREGROUND, text);
+    } else {
+        snprintf(text, sizeof(text), "SoC temperature: unavailable (%s)", esp_err_to_name(power.soc_err));
+        line = draw_line(right_x, line, COL_WARN, text);
+    }
+
+    if (power.has_charger_ts) {
+        snprintf(text, sizeof(text), "Charger TS: %.2f %% of VREGN", power.charger_ts / 100.0f);
+        line = draw_line(right_x, line, COL_FOREGROUND, text);
+    } else {
+        snprintf(text, sizeof(text), "Charger TS: unavailable");
+        line = draw_line(right_x, line, COL_WARN, text);
+    }
+    snprintf(text, sizeof(text), "Charger temp: no NTC fitted");
+    line = draw_line(right_x, line, COL_FOREGROUND, text);
+
+    if (power.has_pmic_faults) {
+        char faults[96] = "";
+        if (power.pmic_faults.chrg_thermal) {
+            strlcat(faults, "thermal ", sizeof(faults));
+        }
+        if (power.pmic_faults.chrg_input) {
+            strlcat(faults, "input ", sizeof(faults));
+        }
+        if (power.pmic_faults.chrg_safety) {
+            strlcat(faults, "safety ", sizeof(faults));
+        }
+        if (power.pmic_faults.ntc_cold || power.pmic_faults.ntc_hot) {
+            strlcat(faults, "ntc ", sizeof(faults));
+        }
+        if (power.pmic_faults.boost) {
+            strlcat(faults, "boost ", sizeof(faults));
+        }
+        if (power.pmic_faults.batt_ovp) {
+            strlcat(faults, "battery ", sizeof(faults));
+        }
+        if (faults[0] == '\0') {
+            snprintf(text, sizeof(text), "Charger faults: none");
+            line = draw_line(right_x, line, COL_FOREGROUND, text);
+        } else {
+            // Too long for one line together with the label.
+            line = draw_line(right_x, line, COL_WARN, "Charger faults:");
+            line = draw_line(right_x, line, COL_WARN, faults);
+        }
+    }
+
+    if (dropped_line_count != 0 || clipped_line_count != 0) {
+        snprintf(text, sizeof(text), "%u dropped %u clipped", dropped_line_count, clipped_line_count);
+        pax_draw_text(&fb, COL_WARN, TEXT_FONT, TEXT_SIZE, (float)screen_w - MARGIN_X - (float)strlen(text) * CHAR_W,
+                      footer_y, text);
+    }
+
+    blit();
 }
 
 void app_main(void) {
@@ -108,7 +358,7 @@ void app_main(void) {
             break;
     }
 
-        // Initialize graphics stack
+    // Initialize graphics stack
 #if defined(CONFIG_BSP_TARGET_KAMI)
     // Temporary addition for supporting epaper devices (irrelevant for Tanmatsu)
     format = PAX_BUF_2_PAL;
@@ -122,115 +372,62 @@ void app_main(void) {
 #endif
     pax_buf_set_orientation(&fb, orientation);
 
-#if defined(CONFIG_BSP_TARGET_KAMI)
-#define BLACK 0
-#define WHITE 1
-#define RED   2
-#else
-#define BLACK 0xFF000000
-#define WHITE 0xFFFFFFFF
-#define RED   0xFFFF0000
-#endif
-
     // Get input event queue from graceloader (merges native + USB keyboard)
     ESP_ERROR_CHECK(gl_input_get_queue(&input_event_queue));
 
-    // LEDs
-    bsp_led_set_pixel(0, 0xFF0000);  // Red
-    bsp_led_set_pixel(1, 0x00FF00);  // Green
-    bsp_led_set_pixel(2, 0x0000FF);  // Blue
-    bsp_led_set_pixel(3, 0xFFFF00);  // Yellow
-    bsp_led_set_pixel(4, 0x00FFFF);  // Magenta
-    bsp_led_set_pixel(5, 0xFF00FF);  // Cyan
-    bsp_led_send();                  // Send data to the coprocessor
-    bsp_led_set_mode(false);         // Take control over all LEDs by disabling automatic mode
+    // What the app reports
+    esp_chip_info(&chip);
+    ESP_ERROR_CHECK(power_info_init());
 
-    // Main section of the app
+    // The optional external display. Probed before the burn tasks exist, so
+    // the bus is free while it looks for the tube.
+    vfd_init();
 
-    // This example shows how to read from the BSP event queue to read input events
+    // What the app measures
+    burn_start();
 
-    // If you want to run something at an interval in this same main thread you can replace portMAX_DELAY with an amount
-    // of ticks to wait, for example pdMS_TO_TICKS(1000)
+    // The burn tasks run at priority 1; this task has to be above them to keep
+    // redrawing while both cores are loaded.
+    vTaskPrioritySet(NULL, 2);
 
-    pax_background(&fb, WHITE);
-    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Welcome! Press any key to trigger an event.");
-    blit();
-
+    render();
     while (1) {
         bsp_input_event_t event;
-        if (xQueueReceive(input_event_queue, &event, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(input_event_queue, &event, pdMS_TO_TICKS(500)) == pdTRUE) {
             switch (event.type) {
-                case INPUT_EVENT_TYPE_KEYBOARD: {
-                    if (event.args_keyboard.ascii != '\b' ||
-                        event.args_keyboard.ascii != '\t') {  // Ignore backspace & tab keyboard events
-                        ESP_LOGI(TAG, "Keyboard event %c (%02x) %s", event.args_keyboard.ascii,
-                                 (uint8_t)event.args_keyboard.ascii, event.args_keyboard.utf8);
-                        pax_simple_rect(&fb, WHITE, 0, 0, pax_buf_get_width(&fb), 72);
-                        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Keyboard event");
-                        char text[64];
-                        snprintf(text, sizeof(text), "ASCII:     %c (0x%02x)", event.args_keyboard.ascii,
-                                 (uint8_t)event.args_keyboard.ascii);
-                        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 18, text);
-                        snprintf(text, sizeof(text), "UTF-8:     %s", event.args_keyboard.utf8);
-                        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 36, text);
-                        snprintf(text, sizeof(text), "Modifiers: 0x%0" PRIX32, event.args_keyboard.modifiers);
-                        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 54, text);
-                        blit();
-                    }
-                    break;
-                }
                 case INPUT_EVENT_TYPE_NAVIGATION: {
-                    ESP_LOGI(TAG, "Navigation event %0" PRIX32 ": %s", (uint32_t)event.args_navigation.key,
-                             event.args_navigation.state ? "pressed" : "released");
-
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F1) {
-                        bsp_device_restart_to_launcher();
+                    if (!event.args_navigation.state) {
+                        break;
                     }
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F2) {
-                        bsp_input_set_backlight_brightness(0);
+                    switch (event.args_navigation.key) {
+                        case BSP_INPUT_NAVIGATION_KEY_ESC:
+                        case BSP_INPUT_NAVIGATION_KEY_F1:
+                        case BSP_INPUT_NAVIGATION_KEY_GAMEPAD_B:
+                            burn_set_enabled(false);
+                            vfd_shutdown();  // not a tube left burning on a battery
+                            bsp_device_restart_to_launcher();
+                            return;
+                        case BSP_INPUT_NAVIGATION_KEY_F3:
+                            vfd_set_enabled(!vfd_is_enabled());
+                            break;
+                        case BSP_INPUT_NAVIGATION_KEY_F4:
+                            burn_adjust_load_percent(-5);
+                            break;
+                        case BSP_INPUT_NAVIGATION_KEY_F5:
+                            burn_adjust_load_percent(5);
+                            break;
+                        case BSP_INPUT_NAVIGATION_KEY_F6:
+                            burn_set_enabled(!burn_is_enabled());
+                            break;
+                        default:
+                            break;
                     }
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F3) {
-                        bsp_input_set_backlight_brightness(100);
-                    }
-
-                    pax_simple_rect(&fb, WHITE, 0, 100, pax_buf_get_width(&fb), 72);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 100 + 0, "Navigation event");
-                    char text[64];
-                    snprintf(text, sizeof(text), "Key:       0x%0" PRIX32, (uint32_t)event.args_navigation.key);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 100 + 18, text);
-                    snprintf(text, sizeof(text), "State:     %s", event.args_navigation.state ? "pressed" : "released");
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 100 + 36, text);
-                    snprintf(text, sizeof(text), "Modifiers: 0x%0" PRIX32, event.args_navigation.modifiers);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 100 + 54, text);
-                    blit();
-                    break;
-                }
-                case INPUT_EVENT_TYPE_ACTION: {
-                    ESP_LOGI(TAG, "Action event 0x%0" PRIX32 ": %s", (uint32_t)event.args_action.type,
-                             event.args_action.state ? "yes" : "no");
-                    pax_simple_rect(&fb, WHITE, 0, 200 + 0, pax_buf_get_width(&fb), 72);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 200 + 0, "Action event");
-                    char text[64];
-                    snprintf(text, sizeof(text), "Type:      0x%0" PRIX32, (uint32_t)event.args_action.type);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 200 + 36, text);
-                    snprintf(text, sizeof(text), "State:     %s", event.args_action.state ? "yes" : "no");
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 200 + 54, text);
-                    blit();
-                    break;
-                }
-                case INPUT_EVENT_TYPE_SCANCODE: {
-                    ESP_LOGI(TAG, "Scancode event 0x%0" PRIX32, (uint32_t)event.args_scancode.scancode);
-                    pax_simple_rect(&fb, WHITE, 0, 300 + 0, pax_buf_get_width(&fb), 72);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 300 + 0, "Scancode event");
-                    char text[64];
-                    snprintf(text, sizeof(text), "Scancode:  0x%0" PRIX32, (uint32_t)event.args_scancode.scancode);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 300 + 36, text);
-                    blit();
                     break;
                 }
                 default:
                     break;
             }
         }
+        render();
     }
 }

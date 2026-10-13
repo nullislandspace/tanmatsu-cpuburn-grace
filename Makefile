@@ -4,8 +4,8 @@ BADGELINKPORT ?= $(PORT)
 SHELL := /usr/bin/env bash
 
 # App installation settings
-APP_SLUG_NAME ?= tld.username.gracetemplate
-APP_INSTALL_BASE_PATH ?= /int/apps/
+APP_SLUG_NAME ?= at.cavac.cpuburn
+APP_INSTALL_BASE_PATH ?= /sd/apps/
 APP_INSTALL_PATH = $(APP_INSTALL_BASE_PATH)$(APP_SLUG_NAME)
 
 # ESP-IDF tools path (needed for the RISC-V cross-compiler)

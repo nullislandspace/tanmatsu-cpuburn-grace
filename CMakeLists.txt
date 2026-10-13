@@ -10,6 +10,11 @@ project(app C)
 # App source files — add your .c files here
 set(APP_SOURCES
     main/main.c
+    main/burn.c
+    main/power_info.c
+    # Optional external VFD on the CATT or internal I2C bus: a probe of both
+    # buses and a cheap no-op on a badge that has none (main/vfd.h).
+    main/vfd.c
     main/crt0.c
 )
 

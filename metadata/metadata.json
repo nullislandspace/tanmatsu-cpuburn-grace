@@ -1,6 +1,6 @@
 {
   "name": "CPU Burn",
-  "description": "Load both cores and watch battery, power supply and temperatures",
+  "description": "CPU and power tests",
   "categories": ["tools"],
   "version": "0.1.0",
   "icon": {
